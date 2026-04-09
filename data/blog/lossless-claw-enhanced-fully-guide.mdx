@@ -1,0 +1,412 @@
+---
+title: 🦞OpenClaw 第二大脑：lossless-claw-enhanced 精准记忆插件完全指南
+date: '2026-04-06'
+tags:
+- tool
+- AI助手
+- OpenClaw
+- lossless-claw
+- 上下文管理
+- 记忆系统
+- LLM
+draft: false
+summary: 详解 lossless-claw-enhanced：解决 CJK Token 估算不准的核心问题，详解 DAG 摘要系统与 legacy 滑动窗口的区别，完整安装配置指南与常见坑排查。
+authors:
+- default
+---
+
+难度：中等 · 时长：约 15 分钟 · 收获：理解 DAG 摘要原理，安装配置 lossless-claw-enhanced，规避常见配置坑
+
+## 背景：上下文管理的痛点
+
+用 AI 助手处理长对话时，传统方案是"截断"——上下文快满时，直接丢掉最老的消息。结果是：AI 会忘记早期说过的重要事实、决定或上下文。
+
+OpenClaw 默认的 legacy context engine 用的是**滑动窗口（sliding window）**策略——直接丢弃最老的 N 条消息。这对需要长期记忆的任务来说是致命的。
+
+**lossless-claw** 是一个 OpenClaw 插件，用 **DAG（有向无环图）式摘要系统**替代滑动窗口：消息永远不丢失，而是压缩成多层级摘要，按需展开还原。
+
+而 **lossless-claw-enhanced** 是 `win4r` 的增强 fork，在原版基础上额外修复了 **CJK 字符 Token 估算偏低** 的核心问题。
+
+> 项目地址：[win4r/lossless-claw-enhanced](https://github.com/win4r/lossless-claw-enhanced)
+
+## 滑动窗口 vs DAG 摘要：核心区别
+
+| | Legacy Sliding Window | lossless-claw DAG 摘要 |
+|---|---|---|
+| **消息处理** | 直接丢弃最老消息 | 压缩为摘要，永久保留 |
+| **历史追溯** | ❌ 不可恢复 | ✅ 任意时刻可展开还原 |
+| **上下文质量** | 越来越小，越来越碎 | 层级摘要，保留关键信息 |
+| **长期对话** | 后期完全失忆 | 全程保持记忆连贯性 |
+| **Token 消耗** | 低，但牺牲质量 | 略高，但记忆质量高得多 |
+
+DAG 的好处是**无损**——原始消息存在 SQLite 里，摘要像索引一样指向它们，需要时可以精确展开某条历史记录的细节。
+
+## 增强版修复了什么
+
+### 1. CJK Token 估算修复（核心问题）
+
+原版使用 `Math.ceil(text.length / 4)` 估算 Token，假设 4 个字符约等于 1 个 Token。这个公式对英文有效，但对中文/日文/韩文（CJK）严重偏低。
+
+**实测对比：**
+
+```
+"这个项目的架构设计非常优秀"（14个CJK字符）
+  原版估算：ceil(14 / 4) = 4 tokens    ❌ 严重偏低
+  增强版：  ceil(14 × 1.5) = 21 tokens  ✅ 接近真实值
+  实际(cl100k_base)：          19 tokens
+```
+
+| 字符类型 | 原版估算 | 增强版估算 | 修正倍数 |
+|---------|---------|-----------|---------|
+| ASCII/Latin | 0.25 tokens/字 | 0.25 tokens/字 | 不变 |
+| CJK（中文/日文/韩文） | 0.25 tokens/字 | **1.5 tokens/字** | **6 倍** |
+| Emoji / 补充字符 | 0.5 tokens/字 | **2.0 tokens/字** | **4 倍** |
+
+**影响：** CJK 估算偏低会导致 compaction 触发过晚、上下文预算失准、大文件拦截失效。中文 AI 对话使用原版 lossless-claw，实际上下文窗口会比估算值更早溢出。
+
+### 2. 从上游 cherry-pick 的 Bug 修复
+
+| PR | 修复内容 | 影响 |
+|----|---------|------|
+| [#178](https://github.com/Martian-Engineering/lossless-claw/pull/178) | 修复 `stripAuthErrors()` 误判 | 对话中提到"401"或"API key"不会触发假性认证失败 |
+| [#190](https://github.com/Martian-Engineering/lossless-claw/pull/190) | 修复 session 文件轮转检测 | `/reset` 后新 session 的 compaction 正常触发 |
+| [#172](https://github.com/Martian-Engineering/lossless-claw/pull/172) | 跳过空 error/aborted 消息 | 避免 API 500 产生的空消息形成死循环 |
+
+## 工作原理：DAG 摘要系统
+
+### 数据模型
+
+```
+Conversation（对话）
+  └── Message（原始消息，永久存储）
+        ├── seq：序号
+        ├── content：纯文本
+        ├── tokenCount：Token 数（CJK 修正后）
+        └── message_parts：原始结构（工具调用/结果等）
+
+  └── Summary（摘要，DAG 节点）
+        ├── depth：层级（0=leaf，1+=condensed）
+        ├── summaryId：摘要唯一 ID
+        ├── source → 指向原始消息或下级摘要
+        └── descendantCount：后代摘要数量
+```
+
+### 两级摘要
+
+**Leaf Summary（深度 0）：**
+- 直接由原始消息块压缩生成
+- 每条约 800–1200 tokens
+- 保留时间戳和关键事实
+
+**Condensed Summary（深度 1+）：**
+- 由多个同层级摘要再次压缩生成
+- 层级越高，内容越抽象
+- 形成 DAG 结构，越顶层越精炼
+
+### Compaction 生命周期
+
+```
+新消息进入
+    ↓
+ingest：写入 SQLite，更新 context_items
+    ↓
+afterTurn：判断是否触发 compaction
+    ↓
+Leaf Pass：将一批原始消息 → leaf summary
+    ↓
+Condensation：满足条件时，leaf → condensed（逐层向上）
+    ↓
+context_items 更新：消息被摘要替换，上下文窗口始终可控
+```
+
+### Context Assembly（上下文组装）
+
+当模型需要回复时，lossless-claw 从 DAG 中选取最相关的节点重建上下文：
+
+1. 保留 **fresh tail**（最近 N 条消息，原始形式）
+2. 从最新往最老遍历，选取摘要填满上下文预算
+3. 摘要之间的衔接处，插入 `previous_context`（前一条摘要的摘要）保证连续性
+
+## 安装步骤
+
+### 前置条件
+
+- OpenClaw 已正常运行
+- Node.js / npm（插件自身依赖）
+- Git（用于克隆仓库）
+
+### Step 1：克隆仓库
+
+```bash
+git clone https://github.com/win4r/lossless-claw-enhanced.git
+cd lossless-claw-enhanced
+```
+
+### Step 2：安装 npm 依赖
+
+```bash
+npm install
+```
+
+> ⚠️ `--link` 模式不会自动安装依赖，必须手动执行一次 `npm install`。
+
+### Step 3：Link 模式安装插件
+
+**推荐 link 模式**（代码改动后 OpenClaw 直接读取最新版本，无需重装）：
+
+```bash
+openclaw plugins install --link ./lossless-claw-enhanced
+
+# 等价写法
+openclaw plugins install -l ./lossless-claw-enhanced
+```
+
+**copy 模式**（安装固定快照，后续不跟踪更新）：
+
+```bash
+openclaw plugins install ./lossless-claw-enhanced
+```
+
+### Step 4：配置 contextEngine Slot（关键！）
+
+插件装完后，**必须手动切换 context engine slot**，否则系统仍用 legacy 引擎。
+
+编辑 `~/.openclaw/openclaw.json`，在 `plugins` 中加入：
+
+```json
+{
+  "plugins": {
+    "slots": {
+      "contextEngine": "lossless-claw"
+    },
+    "entries": {
+      "lossless-claw": {
+        "enabled": true,
+        "config": {
+          "freshTailCount": 32,
+          "contextThreshold": 0.75,
+          "incrementalMaxDepth": -1,
+          "ignoreSessionPatterns": [
+            "agent:*:cron:**",
+            "agent:*:subagent:**"
+          ],
+          "summaryModel": "minimax/MiniMax-M2.7-highspeed"
+        }
+      }
+    }
+  }
+}
+```
+
+### Step 5：重启 Gateway
+
+```bash
+openclaw gateway restart
+```
+
+> [!WARNING]
+> 配置修改后**必须重启 Gateway**，否则插件不会生效。
+
+## 参数配置详解
+
+### 核心参数
+
+| 参数 | 默认值 | 说明 |
+|------|-------|------|
+| `contextThreshold` | `0.75` | 上下文达到窗口 75% 时触发 compaction |
+| `freshTailCount` | `32` | 最近 N 条消息不压缩，保护最新语境 |
+| `incrementalMaxDepth` | `0` | 自动向上凝聚的层级（`-1`=无限制） |
+| `leafMinFanout` | `8` | leaf pass 最小消息数 |
+| `condensedMinFanout` | `4` | condensation 最小摘要数 |
+| `leafTargetTokens` | `1200` | leaf 摘要目标长度 |
+| `condensedTargetTokens` | `2000` | condensed 摘要目标长度 |
+| `leafChunkTokens` | `20000` | 单次 leaf pass 最大输入 tokens |
+
+### 参数调整建议
+
+**长时间对话（数周/数月）推荐：**
+
+```json
+{
+  "freshTailCount": 48,
+  "contextThreshold": 0.70,
+  "incrementalMaxDepth": -1
+}
+```
+
+**短对话/快节奏任务推荐：**
+
+```json
+{
+  "freshTailCount": 16,
+  "contextThreshold": 0.85,
+  "incrementalMaxDepth": 0
+}
+```
+
+**编码场景（推荐）：**
+
+```json
+{
+  "freshTailCount": 32,
+  "leafTargetTokens": 1000
+}
+```
+
+### 摘要模型配置
+
+默认使用主会话当前模型做摘要，也可指定独立模型：
+
+```bash
+# 环境变量方式（优先级最高，会覆盖配置文件！）
+export LCM_SUMMARY_MODEL=anthropic/claude-haiku-4-5
+export LCM_SUMMARY_PROVIDER=anthropic
+
+# 配置文件方式
+"summaryModel": "minimax/MiniMax-M2.7-highspeed"
+```
+
+> [!WARNING]
+> `LCM_SUMMARY_MODEL` **环境变量会覆盖** `config.json` 里的 `summaryModel`。如果发现配置不生效，先检查环境里有没有设这个变量：`hermes config get LCM_SUMMARY_MODEL`（或对应 OpenClaw 命令）。
+
+## 常见坑与排查
+
+### 坑 1：装了插件但没切 slot（最常见）
+
+插件装上了，但 `contextEngine` 还是 legacy，系统继续用滑动窗口。
+
+**检查：**
+```bash
+openclaw plugins inspect lossless-claw
+```
+
+输出应有 `Status: loaded`。同时确认 `openclaw.json` 中有 `"slots.contextEngine": "lossless-claw"`。
+
+### 坑 2：改了配置没重启 Gateway
+
+配置写入后 Gateway 没重启，插件仍是旧配置加载。
+
+**解决：** 每次改完配置执行 `openclaw gateway restart`。
+
+### 坑 3：LCM_SUMMARY_MODEL 环境变量覆盖
+
+在 `.bashrc` 或 `.zshrc` 里设了 `LCM_SUMMARY_MODEL`，结果覆盖了配置文件里的 `summaryModel`。
+
+**检查：**
+```bash
+echo $LCM_SUMMARY_MODEL
+```
+
+如果返回了值，说明环境变量已设置。要么 `unset LCM_SUMMARY_MODEL`，要么在环境变量里改成目标模型。
+
+### 坑 4：ignoreSessionPatterns 漏配导致 cron/subagent 也被压缩
+
+如果没配置 `ignoreSessionPatterns`，cron 任务和 subagent session 也会被 lossless-claw 跟踪和压缩，浪费资源。
+
+**推荐配置：**
+```json
+"ignoreSessionPatterns": [
+  "agent:*:cron:**",
+  "agent:*:subagent:**"
+]
+```
+
+### 坑 5：SQLite 数据库损坏
+
+LCM 使用 SQLite 存储（`~/.openclaw/lcm.db`），异常断电可能导致数据库损坏。
+
+**解决：** 删除数据库重启，LCM 会自动重建：
+```bash
+rm ~/.openclaw/lcm.db
+openclaw gateway restart
+```
+> 注意：历史消息和摘要会丢失，无法恢复。
+
+## 验证安装成功
+
+```bash
+# 1. 检查插件加载状态
+openclaw plugins inspect lossless-claw
+# 预期：Status: loaded
+
+# 2. 检查 context engine slot
+openclaw plugins list
+# 预期：lossless-claw 在 loaded 列表中
+
+# 3. 运行健康检查
+openclaw doctor
+
+# 4. 查看 LCM 数据库状态
+ls -la ~/.openclaw/lcm.db
+# 预期：文件存在且有内容
+```
+
+## 已知缺点：上下文膨胀导致回复延迟
+
+lossless-claw-enhanced 的 DAG 摘要系统大幅提升了记忆质量，但在实际使用中发现了一个值得关注的代价。
+
+### 问题现象
+
+当 LCM 压缩了大量历史消息后，每次模型回复前需要将 LCM 数据库中的消息/摘要重新组装成上下文上下文。这个过程会随着摘要层级和总量的增加而变长，导致**回复延迟明显增加**。
+
+实测数据（当前会话）：
+- Context 使用量：154k / 205k tokens（75%）
+- LCM Cache 命中率：0%（几乎无缓存）
+- Compaction 次数：0 次（未触发过压缩）
+
+这种情况下，每次回复都有大量时间花销在：
+1. **LCM 摘要加载**：将 DAG 中的消息/摘要解压并组装到 context
+2. **上下文处理**：154k tokens 的 context 需要模型每次都扫描一遍
+3. **模型推理冷启动**：等待 MiniMax 模型处理大量 context 的初始化时间
+
+### 根本原因
+
+LCM 的 DAG 摘要系统设计优先考虑的是**记忆完整性**而非**推理速度**。当会话持续较长时间后：
+
+```
+原始消息 → Leaf Summary → Condensed Summary → ...
+     ↓            ↓               ↓
+   永久存储     永久存储         永久存储
+```
+
+每次回复时，系统需要从 DAG 中选取最相关的节点重建上下文。当摘要层级深、节点多时，context 组装成本显著增加。
+
+### 缓解方案
+
+| 方案 | 效果 | 代价 |
+|------|------|------|
+| 降低 `contextThreshold`（如设为 0.5） | 更频繁压缩，上下文更小 | 更多 LLM 调用用于摘要 |
+| 降低 `incrementalMaxDepth`（如设为 0） | 减少多层摘要累积 | 历史深层信息更依赖 leaf summary |
+| 定期 `/reset` 新建会话 | 彻底清空 context | 丢失跨会话记忆 |
+| 减小 `freshTailCount`（如设为 16） | 减少原始消息保留量 | 最新语境减少 |
+| 关闭 `incrementalMaxDepth: -1` 自动向上凝聚 | 避免深层 DAG | 摘要层级减少，抽象程度降低 |
+
+### 当前建议
+
+如果**回复延迟**成为主要痛点，而**超长记忆**不是刚需，可以考虑：
+
+```json
+{
+  "freshTailCount": 16,
+  "contextThreshold": 0.70,
+  "incrementalMaxDepth": 0
+}
+```
+
+这样系统只做 leaf summary，不会自动向上凝聚成深层 DAG，上下文体积可控。
+
+如果需要持续数月的超长记忆，则接受更高的回复延迟，或考虑在 `summaryModel` 上使用更快的模型（如 MiniMax-M2.7-highspeed 本身）来加速摘要生成。
+
+## 总结
+
+**lossless-claw-enhanced** 对中文 AI 对话场景是必需品——原版 `Math.ceil(len/4)` 的 Token 估算在 CJK 上偏差高达 6 倍，导致 compaction 时机错误、上下文溢出。
+
+DAG 摘要系统的核心价值是**无损记忆**：消息永久保留，摘要像索引一样指向原始内容，需要时精确展开。它比滑动窗口消耗更多 Token，但换来了真正的长期记忆能力。
+
+**安装口诀：**
+```
+克隆 → npm install → openclaw plugins install -l . → 
+配置 slots.contextEngine → openclaw gateway restart → 验证
+```
+
+配上 `incrementalMaxDepth: -1` 和 CJK 修正的 Token 估算，长达数月的对话也不会丢失关键上下文。

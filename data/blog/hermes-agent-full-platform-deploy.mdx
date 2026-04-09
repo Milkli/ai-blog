@@ -1,0 +1,639 @@
+---
+title: 'Hermes Agent 实战: Telegram/飞书/企业微信全平台 AI 助手搭建'
+date: '2026-04-01'
+tags:
+- tool
+- AI助手
+- Hermes
+- Telegram
+- 飞书
+- 企业微信
+draft: false
+summary: Hermes Agent 实战教程，通过一个进程同时接入 Telegram、飞书和企业微信三大平台，掌握全平台 AI 助手搭建核心配置。
+authors:
+- default
+---
+
+难度：中等 · 时长：约 20 分钟 · 收获：掌握 Hermes 全平台接入核心配置
+
+你有没有想过——同一个 AI 助手，同时跑在 Telegram、飞书和企业微信里，而且只部署一次？Hermes Agent 就能做到。
+
+它是 Nous Research 开源的自学进化型 AI Agent，最大的亮点之一就是内置了一个全平台消息网关。你只需要在服务器上启动一个进程，就能同时接入 Telegram、Discord、Slack、飞书、企业微信、Signal、WhatsApp 等 10+ 消息平台。消息自动路由，记忆跨平台共享，配置一次，永久生效。
+
+今天这篇文章，我们一起来把三个最常用的平台——Telegram、飞书（ Lark）、企业微信——全部接起来。
+
+## 目标读者
+
+本文适合以下开发者：
+
+- 有一定 Linux / 命令行基础，想在服务器上自托管 AI Agent
+- 对多平台消息接入有需求的独立开发者或小型团队
+- 正在评估 Hermes Agent 作为 OpenClaw 替代方案的团队
+
+> [!TIP]
+> 如果你还没有 LLM API Key，推荐从 [Defapi](https://defapi.org) 获取。Defapi 上的 Claude Opus 4.6 输入 $2.5 / 输出 $12.5 每百万 Token，只有官方价格的一半，性价比极高。具体支持的接口协议见 [Defapi Claude 文档](https://defapi.org/en/model/anthropic/claude-opus-4.6)。
+
+## 核心依赖与环境
+
+| 依赖 | 说明 |
+|------|------|
+| Python3.11+ | 安装脚本自动处理 |
+| 操作系统 | Linux (Ubuntu 22.04+)、macOS 或 WSL2 |
+| 消息平台账号 | Telegram Bot Token / 飞书企业自建应用 / 企业微信 |
+| LLM API Key | 推荐 Defapi（Claude Opus 4.6 半价） |
+| Docker | 可选，v0.6.0 已官方支持容器部署 |
+
+> [!WARNING]
+> Windows 原生不支持，请安装 [WSL2](https://learn.microsoft.com/en-us/windows/wsl/install) 后在 WSL2 终端内操作。
+
+## 完整项目结构
+
+```
+hermes-agent/
+├── scripts/
+│   └── install.sh    # 一键安装脚本
+└── ~/.hermes/        # 主配置目录（安装后自动生成）
+    ├── config.yaml   # 核心配置（模型、工具集）
+    ├── .env          # API Keys（不提交到 Git！）
+    ├── skills/       # 技能目录
+    ├── memory/       # 持久化记忆
+    ├── sessions/     # 会话历史（FTS5 全文检索）
+    └── gateway/      # 网关配置（各平台独立 YAML）
+        ├── telegram.yaml
+        ├── feishu.yaml
+        └── wecom.yaml
+```
+
+## 手把手步骤
+
+### 步骤 1：一键安装 Hermes Agent
+
+Linux / macOS / WSL2 下，执行官方安装脚本：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.sh | bash
+```
+
+安装脚本会自动处理 Python、Node.js 和所有依赖项，全程无需手动干预。安装完成后重载 shell：
+
+```bash
+source ~/.bashrc  # bash 用户
+source ~/.zshrc   # zsh 用户
+```
+
+验证安装成功：
+
+```bash
+hermes doctor
+```
+
+> [!TIP]
+> `hermes doctor` 会自动诊断环境问题——Python 版本、API Key、网络连通性、工具依赖等。第一次运行强烈建议先跑一遍。
+
+### 步骤 2：配置 LLM Provider——对接 Defapi
+
+接下来要告诉 Hermes 去哪里找大模型。我们在 `.env` 文件里写入 API Key：
+
+```bash
+hermes config set ANTHROPIC_API_KEY <your-defapi-key>
+```
+
+Defapi 兼容 Anthropic 的 v1/messages 接口协议，Hermes 可以直接对接。你也可以通过 `hermes model` 命令交互式选择模型和 Provider：
+
+```bash
+hermes model
+# 交互选择：
+# 1. Nous Portal
+# 2. OpenRouter (200+ 模型)
+# 3. OpenAI
+# 4. Defapi / 自定义端点
+# 5. 其他...
+```
+
+如果用 Defapi，在交互菜单里选自定义端点（Custom），填入：
+
+```
+API Endpoint: https://api.defapi.org
+Model: anthropic/claude-opus-4.6
+```
+
+> [!WARNING]
+> `.env` 文件包含你的 API Key，绝对不要提交到 Git 仓库。如果用 Docker 部署，需要通过环境变量或 Docker Secrets 注入，而非直接写在 Dockerfile 里。
+
+### 步骤 2.5（推荐）：配置 config.yaml 完整模板
+
+除了 `.env`，更推荐的方式是直接在 `config.yaml` 中配置 Provider，这样配置可版本控制且结构更清晰：
+
+```yaml
+# ~/.hermes/config.yaml
+model:
+  provider: custom
+  custom_api_base: https://api.defapi.org
+  model: anthropic/claude-opus-4.6
+  api_key: ${DEFAPI_API_KEY}  # 引用环境变量
+
+# 备用 Provider 链（主 Provider 故障时自动切换）
+fallback_providers:
+  - provider: openrouter
+    api_key: ${OPENROUTER_API_KEY}
+
+# 上下文压缩（重要！超过阈值自动压缩历史）
+compression:
+  enabled: true
+  threshold: 0.75  # 上下文用到 75% 时触发压缩
+  summary_model: google/gemini-3-flash-preview
+
+# 工具集配置
+tools:
+  allowed: [web_search, terminal, file, browser]  # 白名单模式
+  blocked: []                                      # 黑名单模式
+
+# 终端后端（生产环境推荐 docker 隔离）
+terminal:
+  backend: docker
+  container_cpu: 2
+  container_memory: 5120
+  container_persistent: true
+
+# 危险命令审批（生产环境建议改为 smart 或 on）
+approvals:
+  mode: smart  # manual | smart | off
+```
+
+```bash
+# 对应 .env 文件只需要写入 Key：
+# ~/.hermes/.env
+DEFAPI_API_KEY=sk-ant-xxx
+OPENROUTER_API_KEY=sk-or-v1-xxx
+```
+
+### 步骤 3：接入第一个平台——Telegram Bot
+
+这是最容易验证的一个平台，因为 Telegram 的 Bot API 是公开的，无需企业认证。具体可参考[官方链接](https://hermes-agent.nousresearch.com/docs/user-guide/messaging/telegram)
+
+#### 3.1 创建 Bot
+
+在 Telegram 里找 [@BotFather](https://t.me/BotFather)，发送 `/newbot`，按提示命名 Bot 并获取 BOT_TOKEN，格式类似 `123456789:ABCdefGHIjklMNOpqrsTUVwxyz`。
+
+#### 3.2 配置 Hermes 网关
+
+```bash
+hermes gateway setup
+# 选择 telegram，进入交互配置
+```
+
+或者手动创建 `~/.hermes/gateway/telegram.yaml`：
+
+```yaml
+platform: telegram
+enabled: true
+bot_token: "123456789:ABCdefGHIjklMNOpqrsTUVwxyz"
+
+# 访问控制：只允许特定用户
+allowed_users:
+  - your_telegram_username
+
+# 安全设置
+require_approval_for_dangerous_tools: true
+```
+
+#### 3.3 验证
+
+启动网关后，给 Bot 发一条消息：
+
+```bash
+hermes gateway start
+# 或者后台运行：
+hermes gateway start --daemon
+```
+
+在 Telegram 里给 Bot 发 `/new`，Bot 应该回复欢迎消息。发一条中文消息试试，比如"你好"，看看 AI 是否有响应。
+
+> [!TIP]
+> 如果 Bot 没有响应，检查：`hermes gateway status` 查看运行状态，`hermes logs` 查看最新日志。常见原因是 Bot Token 填错或者端口被占用。
+
+### 步骤 4：接入飞书（Lark）企业应用
+
+飞书接入稍微复杂一点，需要在飞书开放平台创建一个企业自建应用，具体可参考[官方链接](https://hermes-agent.nousresearch.com/docs/user-guide/messaging/feishu)
+
+#### 4.1 在飞书开放平台创建应用
+
+- 打开 [飞书开放平台](https://open.feishu.cn/app)，创建一个企业自建应用
+- 在「凭证与基础信息」里获取 App ID 和 App Secret
+- 开启「机器人」能力
+
+#### 4.2 配置事件订阅
+
+在应用的「事件订阅」中：
+
+- 请求地址 URL 填：`https://你的域名/gateway/feishu/webhook`
+- 事件选择：`im.message.receive_v1`（接收消息）
+
+> [!WARNING]
+> 飞书要求回调 URL 必须是公网可访问的 HTTPS 地址。如果你的服务器没有公网域名，可以用 ngrok 做临时内网穿透：`ngrok http 8080`，将生成的 HTTPS 地址填入飞书。
+
+#### 4.3 安装应用到企业
+
+在「版本管理与发布」中创建版本并发布，否则 Bot 无法接收消息。
+
+#### 4.4 配置 Hermes 网关
+
+```bash
+hermes gateway setup
+# 选择 feishu，交互填入 App ID 和 App Secret
+# 输入App Secret时不会显示，直接按enter即可
+```
+
+手动在 `~/.hermes/.env` 中添加（注意 `.env` 是 `KEY=VALUE` 格式，不是 YAML）：
+
+```bash
+hermes config set FEISHU_APP_ID cli_xxx
+hermes config set FEISHU_APP_SECRET secret_xxx
+hermes config set FEISHU_CONNECTION_MODE websocket
+```
+
+或者直接编辑 `~/.hermes/.env`：
+
+```bash
+# ~/.hermes/.env
+FEISHU_APP_ID=cli_xxx
+FEISHU_APP_SECRET=secret_xxx
+FEISHU_CONNECTION_MODE=websocket
+
+# 可选但强烈推荐
+FEISHU_ALLOWED_USERS=ou_xxx,ou_yyy
+FEISHU_HOME_CHANNEL=oc_xxx
+```
+
+`FEISHU_DOMAIN` 接受：`feishu`（中国飞书）或 `lark`（Lark 国际版），通过以下方式设置：
+
+```bash
+hermes config set FEISHU_DOMAIN feishu
+```
+
+#### 4.5 验证
+
+在飞书里给 Bot 发消息 `/new`，看是否有响应。飞书的消息格式和 Telegram 不同，Bot 支持富文本消息卡片，Hermes 会自动适配。
+
+### 步骤 5：接入企业微信（WeCom）
+
+企业微信的接入方式和飞书类似，也是走回调 Webhook 模式。具体可参考[官方链接](https://hermes-agent.nousresearch.com/docs/user-guide/messaging/wecom)
+
+#### 5.1 在企业微信管理后台创建应用
+
+- 登录 [企业微信管理后台](https://work.weixin.qq.com)
+- 进入「应用管理」→「创建应用」→ 选择「企业自建」
+- 获取 AgentId、Secret、和企业 CorpId
+- 设置「企业可信IP」为你的服务器 IP
+
+#### 5.2 配置接收消息
+
+在应用设置中开启「接收消息」模式：
+
+- 填写 URL：`https://你的域名/gateway/wecom/webhook`
+- 选择「兼容模式」或「事件模式」
+
+#### 5.3 配置 Hermes 网关
+
+```yaml
+# ~/.hermes/gateway/wecom.yaml
+platform: wecom
+enabled: true
+corp_id: "wwxxxxxxxxxxxxxx"
+agent_id: "1000001"
+corp_secret: "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+encrypt_mode: "safe"  # 安全模式需要配置 encoding_aes_key
+encoding_aes_key: "your_32_char_aes_key"
+```
+
+#### 5.4 验证
+
+企业微信里找到你的应用，发一条消息测试。
+
+> [!TIP]
+> 企业微信对 IP 白名单要求严格。如果部署在云服务器上（如 DigitalOcean、Hetzner），务必在管理后台将服务器公网 IP 加入可信 IP 列表，否则消息会被企业微信直接拒绝。
+
+### 步骤 6：启动网关，一次跑三个平台
+
+所有平台配置完成后，用一条命令启动网关：
+
+```bash
+hermes gateway start
+```
+
+Hermes 会自动加载 `~/.hermes/gateway/` 下所有已启用平台的配置，并发启动所有适配器。如果某个平台启动失败（比如 Token 错误），不会影响其他平台的正常运行。
+
+其他常用网关命令：
+
+```bash
+hermes gateway stop           # 停止
+hermes gateway restart        # 重启
+hermes gateway start --watch  # 热重载（修改配置后自动生效）
+hermes gateway start --daemon # 后台运行
+hermes logs --platform all    # 查看所有平台日志
+```
+
+> [!TIP]
+> 推荐使用 `--watch` 模式启动：`hermes gateway start --watch`，配置文件修改后自动热重载，无需每次手动重启。
+
+### 步骤 7：多平台消息验证
+
+现在你可以在三个平台上分别发消息给 Bot 测试：
+
+```
+# Telegram
+/new
+你好，介绍一下你自己
+
+# 飞书
+/new
+你是谁？
+
+# 企业微信
+/new
+有什么我能帮你的？
+```
+
+三端响应完全一致，记忆共享——你在 Telegram 里说过的事情，飞书和企业微信都知道。这才是 Hermes 最核心的价值：一次配置，全平台统一体验。
+
+> [!TIP]
+> 如果你想让每个平台跑不同的 Agent 实例（不同的模型、不同的技能集），可以使用 Hermes v0.6.0 新增的 Profiles 功能：`hermes -p telegram profile create`，然后在不同 profile 下配置不同的模型和平台。Profile 之间完全隔离，互不影响。
+
+## 步骤 8：配置工具与工具集
+
+Hermes 的工具系统是其核心能力之一，Agent 可以调用 Web 搜索、终端命令、文件操作、浏览器自动化等多种工具。
+
+### 查看可用工具
+
+```bash
+hermes tools
+```
+
+常用工具集：
+
+| 工具集 | 包含工具 | 适用场景 |
+|--------|---------|---------|
+| `web` | `web_search`, `web_extract` | 搜索和抓取网页 |
+| `terminal` | `bash`, `process` | 执行服务器命令 |
+| `file` | `read_file`, `patch` | 读写和修改文件 |
+| `browser` | `browser_navigate`, `browser_snapshot` | 浏览器自动化 |
+| `vision` | `vision_analyze` | 图片分析 |
+| `image_gen` | `image_generate` | 图片生成 |
+| `todo` | `todo` | 任务管理 |
+| `memory` | `memory`, `session_search` | 记忆与会话搜索 |
+| `cronjob` | 定时任务创建/列表/执行 | 定时自动化 |
+| `delegation` | `delegate_task` | 子 Agent 委托 |
+
+### 启用需要的工具集
+
+```bash
+# 启用工具集
+hermes tools enable web
+hermes tools enable terminal
+hermes tools enable browser
+
+# 在聊天中指定工具集
+/hermes chat --toolsets web,terminal -q "帮我查一下今天的天气"
+```
+
+### 终端后端选择
+
+工具执行的终端后端影响安全隔离级别：
+
+| 后端 | 隔离 | 危险命令检查 | 推荐场景 |
+|------|------|-------------|---------|
+| `local` | 无 | ✅ 是 | 本地开发 |
+| `ssh` | 远程机器 | ✅ 是 | 独立服务器 |
+| `docker` | 容器 | ❌ 跳过 | **生产推荐** |
+| `singularity` | HPC 容器 | ❌ 跳过 | 集群计算 |
+
+生产环境强烈建议使用 `docker` 后端，容器内隔离执行命令，即使 Agent 被滥用也不会直接影响宿主机。
+
+## 步骤 9：安全加固
+
+Hermes 内置五层安全机制，生产部署建议全部开启。
+
+### 危险命令审批
+
+Hermes 会自动拦截危险命令（`rm -r /`、`DROP TABLE`、管道到 `sh` 等），默认需要人工确认：
+
+```yaml
+# config.yaml
+approvals:
+  mode: smart  # manual（每次确认）/ smart（AI 判断）/ off（关闭）
+```
+
+`smart` 模式下，AI 会自动批准低风险操作、拒绝危险操作，不确定时才升级询问。
+
+### 用户白名单
+
+防止未授权用户访问你的 Bot：
+
+```yaml
+# telegram.yaml
+allowed_users:
+  - your_telegram_username
+
+# 全局配置
+require_approval_for_dangerous_tools: true
+```
+
+### DM 配对码
+
+未在白名单的用户可以通过配对码申请访问：
+
+```bash
+hermes pairing approve telegram XKGH5N7P  # 审批配对请求
+```
+
+配对码 1 小时内有效，最多 3 个待处理。
+
+### SSRF 防护
+
+Hermes 自动阻止对以下地址的请求：
+- RFC 1918 私有地址（`10.x`、`172.16.x`、`192.168.x`）
+- 环回地址（`127.0.0.1`、`localhost`）
+- 云元数据服务（`169.254.169.254`）
+
+### 提示注入检测
+
+Hermes 的 Tirith 扫描器会检测上下文文件（SOUL.md、AGENTS.md）中的提示注入攻击模式，并在执行前报警。
+
+## 常见问题排查
+
+### 1. Telegram Bot 收不到消息
+
+症状：Bot 完全不响应，查看日志也没有任何记录。
+
+排查步骤：
+
+```bash
+# 1. 确认 Token 正确
+hermes config get telegram.bot_token
+
+# 2. 确认端口没有被占用
+ss -tlnp | grep 8080
+
+# 3. 如果用了 webhook 模式，检查 Telegram Bot API 配置
+# Webhook URL 必须在公网可访问，本地开发用 ngrok 穿透
+ngrok http 8080
+
+# 4. 重置 webhook（有时候 Bot 卡在旧的 webhook 上）
+curl -X POST "https://api.telegram.org/bot<YOUR_TOKEN>/deleteWebhook"
+```
+
+### 2. 飞书回调验证失败
+
+症状：飞书开放平台显示「回调 URL 校验失败」。
+
+排查步骤：
+
+```bash
+# 1. 确认公网 URL 可访问
+curl -X GET "https://your-domain.com/gateway/feishu/webhook"
+
+# 2. 检查飞书签名验证
+# 飞书使用 AES 加密消息，encrypt_key 必须和后台配置一致
+# 查看 Hermes 日志：
+hermes logs --platform feishu
+```
+
+> [!WARNING]
+> 飞书的加密模式（encrypt_mode）必须和后台设置匹配。如果你在后台选了「安全模式」，Hermes 配置里也必须填 `encrypt_mode: safe` 和对应的 `encoding_aes_key`。
+
+### 3. 企业微信消息无响应
+
+症状：消息发出去没有任何回复，日志里也没有记录。
+
+排查步骤：
+
+```bash
+# 1. 确认 CorpId / AgentId / Secret 填写正确
+
+# 2. 最重要的：检查 IP 白名单
+# 企业微信要求调用 API 的服务器 IP 在可信 IP 列表内
+
+# 3. 获取 AccessToken 测试
+curl "https://qyapi.weixin.qq.com/cgi-bin/gettoken?corpid=wwxxx&corpsecret=secret"
+
+# 如果返回 "errmsg": "ip not in whitelist"，说明 IP 没有加白
+```
+
+### 4. 模型不响应
+
+症状：消息被 Bot 收到了，但 AI 不回复，一直显示 thinking。
+
+排查步骤：
+
+```bash
+# 1. 测试 API Key 是否有效
+curl -X POST "https://api.defapi.org/api/v1/messages" \
+  -H "Authorization: Bearer <your-key>" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"anthropic/claude-opus-4.6","messages":[{"role":"user","content":"hi"}],"max_tokens":10}'
+
+# 2. 检查模型配置
+hermes config get model
+
+# 3. 检查 fallback_providers（推荐配置）
+# 在 ~/.hermes/config.yaml 里添加备用 Provider：
+fallback_providers:
+  - provider: openrouter
+    api_key: "${OPENROUTER_API_KEY}"
+```
+
+> [!TIP]
+> 推荐在 Defapi 之外至少配置一个备用 Provider。Hermes v0.6.0 支持 fallback_providers 链式调用——当主 Provider 超时或返回错误时，自动切换到备用 Provider，保证 Agent 不掉线。
+
+### 5. 工具执行报错
+
+症状：Bot 回复说无法执行某个操作。
+
+排查步骤：
+
+```bash
+# 1. 查看当前启用的工具集
+hermes tools
+
+# 2. 启用需要的工具集
+hermes tools enable web_search
+hermes tools enable terminal
+
+# 3. 危险命令需要人工确认
+hermes config get approval_required
+# 设置为 true 会让所有危险命令需要你手动审批
+```
+
+### 6. 多平台并发冲突
+
+症状：某个平台收到消息后其他平台也没响应了。
+
+```bash
+# 确认只有一个 Hermes 网关实例在运行
+ps aux | grep hermes
+pkill -f hermes-agent
+
+# 然后重新启动
+hermes gateway start
+```
+
+> [!TIP]
+> 用 Profiles 功能可以让每个平台跑完全独立的 Hermes 实例：每个 profile 有自己的配置目录、记忆和会话，不同 profile 之间完全隔离，适合团队里不同成员各自使用自己的 Bot。
+
+## 扩展阅读 / 进阶方向
+
+### 从 OpenClaw 迁移
+
+如果你已经在用 OpenClaw，Hermes 提供了官方迁移工具，能自动导入 SOUL.md、MEMORY.md、Skills、API Keys 和消息平台配置：
+
+```bash
+hermes claw migrate        # 交互式完整迁移
+hermes claw migrate --dry-run  # 先预览
+hermes claw migrate --preset user-data  # 不迁移敏感信息
+```
+
+### MCP Server 模式
+
+Hermes v0.6.0 新增了 MCP Server 能力，可以用一条命令让 Hermes 对外暴露工具：
+
+```bash
+hermes mcp serve
+# 支持 stdio 和 Streamable HTTP 两种传输协议
+```
+
+连接后，Cursor、VS Code、Zed 等 IDE 就能通过 MCP 协议调用 Hermes 的所有工具和对话能力。
+
+### 自定义技能系统
+
+Hermes 的 Skills 系统支持从自然语言描述自动创建技能。也可以手动写：
+
+```bash
+# 查看已有技能
+hermes skills
+
+# 浏览 Skills Hub（社区技能市场）
+/skills
+
+# 从 agentskills.io 安装社区技能
+```
+
+### Cron 定时任务
+
+用自然语言设置定时任务，Hermes 自动执行并推送结果到任意平台：
+
+```bash
+# 每天早上 8 点推送天气报告到 Telegram
+/cron "Every day at 8am, summarize today's weather and send to me" --platform telegram
+```
+
+## 结语
+
+Hermes Agent 的全平台网关设计得非常优雅——你只需要维护一份配置，就能让同一个 Agent 实例跑在任意多个消息平台上。记忆跨平台共享，配置一次搞定，资源占用也比跑多个独立 Bot 低得多。
+
+进阶方向上，本文补充了三个实用能力：
+
+- **工具集**：`hermes tools enable web,terminal` 开启后，Agent 可以搜索网页、执行命令、读写文件
+- **安全加固**：生产环境务必配置 `approvals.mode: smart` 和用户白名单
+- **Profiles 隔离**：每个平台跑独立配置，互不干扰
+
+如果你还在用 OpenClaw，或者正在找一款真正能打的开源 AI Agent，Hermes 值得你花 20 分钟试试。配合 [Defapi](https://defapi.org) 的半价 Claude Opus 4.6，每月成本可以压缩到原来的 50%，体验却一点不打折。
